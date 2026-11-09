@@ -7,13 +7,16 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/docker/cli/cli/config"
 	"github.com/docker/cli/cli/config/configfile"
+	"github.com/docker/cli/cli/config/credentials"
 	"github.com/docker/cli/cli/config/types"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -770,22 +773,57 @@ func checkPullPermissions(ctx context.Context, core v1.CoreV1Interface, trans ht
 }
 
 func secretToConfigFile(sc *corev1.Secret) (*configfile.ConfigFile, error) {
+	var cf *configfile.ConfigFile
 	switch sc.Type {
 	case corev1.SecretTypeDockerConfigJson:
-		cf, err := config.LoadFromReader(bytes.NewReader(sc.Data[corev1.DockerConfigJsonKey]))
+		var err error
+		cf, err = config.LoadFromReader(bytes.NewReader(sc.Data[corev1.DockerConfigJsonKey]))
 		if err != nil {
 			return nil, fmt.Errorf("cannot load config: %w", err)
 		}
-		return cf, nil
 	case corev1.SecretTypeDockercfg:
-		cf := &configfile.ConfigFile{}
+		cf = &configfile.ConfigFile{}
 		if err := json.Unmarshal(sc.Data[corev1.DockerConfigKey], &cf.AuthConfigs); err != nil {
 			return nil, fmt.Errorf("cannot unmarshal config: %w", err)
 		}
-		return cf, nil
 	default:
 		return &configfile.ConfigFile{}, nil
 	}
+	canonicalizeDockerHubAuth(cf)
+	return cf, nil
+}
+
+// dockerHubAuthKey is the key docker/cli stores Docker Hub credentials under.
+const dockerHubAuthKey = "https://index.docker.io/v1/"
+
+// canonicalizeDockerHubAuth copies a Docker Hub entry that a pull secret
+// stores under another spelling, such as "docker.io" or
+// "https://index.docker.io", to dockerHubAuthKey. Since v29.5, docker/cli
+// looks up Docker Hub only under that key; older versions also matched the
+// other spellings by hostname. Entries without credentials are skipped. An
+// entry already under dockerHubAuthKey wins. Otherwise an "index.docker.io"
+// host goes before a "docker.io" host, and keys with the same host go in
+// sorted order.
+func canonicalizeDockerHubAuth(cf *configfile.ConfigFile) {
+	auths := cf.GetAuthConfigs()
+	if hasCredentials(auths[dockerHubAuthKey]) {
+		return
+	}
+	keys := slices.Sorted(maps.Keys(auths))
+	for _, host := range []string{name.DefaultRegistry, "docker.io"} {
+		for _, key := range keys {
+			if credentials.ConvertToHostname(key) == host && hasCredentials(auths[key]) {
+				auths[dockerHubAuthKey] = auths[key]
+				return
+			}
+		}
+	}
+}
+
+// hasCredentials reports whether ac holds more than a server address.
+func hasCredentials(ac types.AuthConfig) bool {
+	ac.ServerAddress = ""
+	return ac != types.AuthConfig{}
 }
 
 type configFileKeychain struct {

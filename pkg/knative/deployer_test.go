@@ -72,6 +72,32 @@ func TestCheckPullPermissions(t *testing.T) {
 		corev1.SecretTypeDockercfg,
 	)
 
+	secretF := createSecret("https://docker.io",
+		username, password,
+		corev1.SecretTypeDockercfg,
+	)
+
+	secretG := createSecret("index.docker.io/v1/",
+		username, password,
+		corev1.SecretTypeDockercfg,
+	)
+
+	secretH := createSecret("docker.io",
+		username, password,
+		corev1.SecretTypeDockerConfigJson,
+	)
+
+	// secretI has an empty entry under the canonical key, as docker login
+	// writes when a credential store keeps the password, and credentials
+	// under docker.io.
+	secretI := createSecret("docker.io",
+		username, password,
+		corev1.SecretTypeDockercfg,
+	)
+	secretI.Data[corev1.DockerConfigKey] = fmt.Appendf(nil,
+		`{%q: {}, "docker.io": {"auth": %q}}`, dockerHubAuthKey,
+		base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
+
 	trans := setupRegistry(t)
 
 	tests := []struct {
@@ -124,6 +150,26 @@ func TestCheckPullPermissions(t *testing.T) {
 			image: imageShortName,
 		},
 		{
+			name:  "dockerhub as https://docker.io",
+			core:  core(secretF),
+			image: imageShortName,
+		},
+		{
+			name:  "dockerhub as index.docker.io/v1/",
+			core:  core(secretG),
+			image: imageShortName,
+		},
+		{
+			name:  "dockerhub as docker.io in dockerconfigjson",
+			core:  core(secretH),
+			image: imageShortName,
+		},
+		{
+			name:  "dockerhub as docker.io next to an empty canonical entry",
+			core:  core(secretI),
+			image: imageShortName,
+		},
+		{
 			name: "refer non-existent secret",
 			core: fake.NewClientset(&corev1.ServiceAccount{
 				ObjectMeta:       metav1.ObjectMeta{Name: "default", Namespace: "default"},
@@ -167,6 +213,60 @@ func TestCheckPullPermissions(t *testing.T) {
 		})
 	}
 
+}
+
+// TestCanonicalizeDockerHubAuth ensures a Docker Hub entry stored under any
+// spelling ends up under the key docker/cli looks up, and that the choice
+// between several entries does not depend on map order.
+func TestCanonicalizeDockerHubAuth(t *testing.T) {
+	tests := []struct {
+		name  string
+		auths map[string]string // key to username
+		want  string            // username under dockerHubAuthKey, "" for none
+	}{
+		{
+			name:  "canonical key wins",
+			auths: map[string]string{dockerHubAuthKey: "canonical", "docker.io": "bare"},
+			want:  "canonical",
+		},
+		{
+			name:  "empty canonical entry does not win",
+			auths: map[string]string{dockerHubAuthKey: "", "docker.io": "bare"},
+			want:  "bare",
+		},
+		{
+			name:  "empty entries skipped",
+			auths: map[string]string{"https://index.docker.io": "", "docker.io": "bare"},
+			want:  "bare",
+		},
+		{
+			name:  "index.docker.io host before docker.io host",
+			auths: map[string]string{"docker.io": "docker", "https://index.docker.io": "index"},
+			want:  "index",
+		},
+		{
+			name:  "same host in sorted order",
+			auths: map[string]string{"https://docker.io": "https", "docker.io": "bare"},
+			want:  "bare",
+		},
+		{
+			name:  "other registries untouched",
+			auths: map[string]string{"quay.io": "quay"},
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cf := &configfile.ConfigFile{AuthConfigs: map[string]types.AuthConfig{}}
+			for key, user := range tt.auths {
+				cf.AuthConfigs[key] = types.AuthConfig{Username: user}
+			}
+			canonicalizeDockerHubAuth(cf)
+			if got := cf.AuthConfigs[dockerHubAuthKey].Username; got != tt.want {
+				t.Errorf("username under %q = %q, want %q", dockerHubAuthKey, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestCheckPullPermissions_FunctionImagePullSecret(t *testing.T) {
